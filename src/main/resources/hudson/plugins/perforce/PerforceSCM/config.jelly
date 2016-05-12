@@ -177,6 +177,11 @@
       <f:checkbox field="updateCounterValue" default="false" />
     </f:entry>
     
+    <f:entry title="Ignore Failed Builds in Generating Changelist" help="/plugin/perforce/help/ignoreFailedBuildsForChanges.html">
+      <f:checkbox field="ignoreFailedBuildsForChanges" default="false" />
+    </f:entry>
+    
+    
     <j:invokeStatic var="hudsonInstance" className="hudson.model.Hudson" method="getInstance"/>
     <j:invoke var="allProjects" on="${hudsonInstance}" method="getJobNames"/>
     <f:entry title="Use Upstream Project revision" help="/plugin/perforce/help/p4UpstreamProject.html">

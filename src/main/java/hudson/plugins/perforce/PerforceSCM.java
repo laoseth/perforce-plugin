@@ -1,5 +1,4 @@
 package hudson.plugins.perforce;
-
 import hudson.plugins.perforce.config.DepotType;
 import com.tek42.perforce.Depot;
 import com.tek42.perforce.PerforceException;
@@ -210,6 +209,11 @@ public class PerforceSCM extends SCM {
      * If true, the ,repository will be deleted before the checkout commences in addition to the workspace.
      */
     boolean wipeRepoBeforeBuild = false;
+    
+    /**
+     * If true, the "Last build changeset" will ignore failed builds
+     */
+    boolean ignoreFailedBuildsForChanges = false;
 
     /**
      * If > 0, then will override the changelist we sync to for the first build.
@@ -308,6 +312,7 @@ public class PerforceSCM extends SCM {
             String p4CommandCharset,
             String clientOwner,
             boolean updateCounterValue,
+            boolean ignoreFailedBuildsForChanges,
             boolean forceSync,
             boolean dontUpdateServer,
             boolean alwaysForceSync,
@@ -353,7 +358,7 @@ public class PerforceSCM extends SCM {
 
         this.p4Counter = Util.fixEmptyAndTrim(p4Counter);
         this.updateCounterValue = updateCounterValue;
-
+        this.ignoreFailedBuildsForChanges = ignoreFailedBuildsForChanges;
         this.p4UpstreamProject = Util.fixEmptyAndTrim(p4UpstreamProject);
 
         //TODO: move optional entries to external classes
@@ -722,7 +727,11 @@ public class PerforceSCM extends SCM {
     }
 
     private int getLastBuildChangeset(@Nonnull AbstractProject project) {
-        Run lastBuild = project.getLastBuild();
+        Run lastBuild;
+        if(ignoreFailedBuildsForChanges)
+        	lastBuild = project.getLastSuccessfulBuild();
+        else
+        	lastBuild= project.getLastBuild();
         return getLastChange(lastBuild);
     }
 
@@ -989,7 +998,7 @@ public class PerforceSCM extends SCM {
                                 "Configured upstream job does not exist anymore: " + p4UpstreamProject + ". Please update your job configuration.");
                     }
                     Run upStreamRun = job.getLastSuccessfulBuild();
-                    int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun);
+                    int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun, false);
                     if (lastUpStreamChange > 0) {
                         log.println("Using P4 revision " + lastUpStreamChange + " from upstream project " + p4UpstreamProject);
                         newestChange = lastUpStreamChange;
@@ -1566,14 +1575,14 @@ public class PerforceSCM extends SCM {
     	if (firstChange > 0)
     		return firstChange;
 
-    	return getLastChangeNoFirstChange(build);
+    	return getLastChangeNoFirstChange(build, ignoreFailedBuildsForChanges);
     }
 
-    private static int getLastChangeNoFirstChange(@CheckForNull Run build) {
+    private static int getLastChangeNoFirstChange(@CheckForNull Run build, boolean requireSuccessfulBuild) {
 
         // If we can't find a PerforceTagAction, we will default to 0.
 
-        PerforceTagAction action = getMostRecentTagAction(build);
+        PerforceTagAction action = getMostRecentTagAction(build, requireSuccessfulBuild);
         if (action == null)
             return 0;
 
@@ -1582,7 +1591,7 @@ public class PerforceSCM extends SCM {
     }
 
     @CheckForNull
-    private static PerforceTagAction getMostRecentTagAction(@CheckForNull Run build) {
+    private static PerforceTagAction getMostRecentTagAction(@CheckForNull Run build, boolean requireSuccessfulBuild) {
         if (build == null)
             return null;
 
@@ -1591,7 +1600,12 @@ public class PerforceSCM extends SCM {
             return action;
 
         // if build had no actions, keep going back until we find one that does.
-        return getMostRecentTagAction(build.getPreviousBuild());
+        Run nextRunToCheck = build.getPreviousBuild();
+        if(requireSuccessfulBuild && nextRunToCheck!=null){
+        	if(build.getResult().isWorseThan(Result.UNSTABLE))
+        		nextRunToCheck=nextRunToCheck.getPreviousCompletedBuild();
+        }
+        return getMostRecentTagAction(nextRunToCheck,requireSuccessfulBuild);
     }
 
     private com.tek42.perforce.model.Workspace getPerforceWorkspace(AbstractProject project, String projectPath,
@@ -2226,7 +2240,7 @@ public class PerforceSCM extends SCM {
             }
 
             Run upStreamRun = job.getLastSuccessfulBuild();
-            int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun);
+            int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun,false);
             if (lastUpStreamChange < 1) {
                 FormValidation.warning("No Perforce change found in this project");
             }
