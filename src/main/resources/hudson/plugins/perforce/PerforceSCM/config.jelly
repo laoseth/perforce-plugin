@@ -178,7 +178,11 @@
     </f:entry>
     
     <f:entry title="Ignore Failed Builds in Generating Changelist" help="/plugin/perforce/help/ignoreFailedBuildsForChanges.html">
-      <f:checkbox field="ignoreFailedBuildsForChanges" default="false" />
+      <f:checkbox field="ignoreFailedBuildsForChanges" default="False" />
+    </f:entry>
+    
+    <f:entry title="Check Viewmap Matches When looking for Last build" help="/plugin/perforce/help/checkViewMapWhenLookingForPreviousChangeNumber.html">
+      <f:checkbox field="checkViewMapWhenLookingForPreviousChangeNumber"/>
     </f:entry>
     
     

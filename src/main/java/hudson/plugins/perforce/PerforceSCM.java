@@ -39,6 +39,8 @@ import hudson.util.LogTaskListener;
 
 import hudson.util.StreamTaskListener;
 import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
@@ -214,6 +216,11 @@ public class PerforceSCM extends SCM {
      * If true, the "Last build changeset" will ignore failed builds
      */
     boolean ignoreFailedBuildsForChanges = false;
+    
+    /**
+     * If true, when looking for the base changelist, this ignores builds where the viewspec was different
+     */
+    boolean checkViewMapWhenLookingForPreviousChangeNumber = false;
 
     /**
      * If > 0, then will override the changelist we sync to for the first build.
@@ -313,6 +320,7 @@ public class PerforceSCM extends SCM {
             String clientOwner,
             boolean updateCounterValue,
             boolean ignoreFailedBuildsForChanges,
+            boolean checkViewMapWhenLookingForPreviousChangeNumber,
             boolean forceSync,
             boolean dontUpdateServer,
             boolean alwaysForceSync,
@@ -359,6 +367,7 @@ public class PerforceSCM extends SCM {
         this.p4Counter = Util.fixEmptyAndTrim(p4Counter);
         this.updateCounterValue = updateCounterValue;
         this.ignoreFailedBuildsForChanges = ignoreFailedBuildsForChanges;
+        this.checkViewMapWhenLookingForPreviousChangeNumber = checkViewMapWhenLookingForPreviousChangeNumber;
         this.p4UpstreamProject = Util.fixEmptyAndTrim(p4UpstreamProject);
 
         //TODO: move optional entries to external classes
@@ -726,15 +735,6 @@ public class PerforceSCM extends SCM {
         return effectiveProjectPath;
     }
 
-    private int getLastBuildChangeset(@Nonnull AbstractProject project) {
-        Run lastBuild;
-        if(ignoreFailedBuildsForChanges)
-        	lastBuild = project.getLastSuccessfulBuild();
-        else
-        	lastBuild= project.getLastBuild();
-        return getLastChange(lastBuild);
-    }
-
     /**
      * Perform some manipulation on the workspace URI to get a valid local path
      * <p>
@@ -980,7 +980,7 @@ public class PerforceSCM extends SCM {
             }
 
             String p4WorkspacePath = "//" + p4workspace.getName() + "/...";
-            int lastChange = getLastChange((Run)build.getPreviousBuild());
+            int lastChange = getLastChange((Run)build.getPreviousBuild(),effectiveProjectPath);
             log.println("Last build changeset: " + lastChange);
 
             // Determine changeset number
@@ -998,7 +998,7 @@ public class PerforceSCM extends SCM {
                                 "Configured upstream job does not exist anymore: " + p4UpstreamProject + ". Please update your job configuration.");
                     }
                     Run upStreamRun = job.getLastSuccessfulBuild();
-                    int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun, false);
+                    int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun, false,null);
                     if (lastUpStreamChange > 0) {
                         log.println("Using P4 revision " + lastUpStreamChange + " from upstream project " + p4UpstreamProject);
                         newestChange = lastUpStreamChange;
@@ -1221,7 +1221,7 @@ public class PerforceSCM extends SCM {
             log.println("This is a matrix run, trying to use change number from parent/siblings...");
             AbstractBuild parentBuild = ((MatrixRun) build).getParentBuild();
             if (parentBuild != null) {
-                int parentChange = getLastChange(parentBuild);
+                int parentChange = getLastChange(parentBuild,projectPath);
                 if (parentChange > 0) {
                     // use existing changeset from parent
                     log.println("Latest change from parent is: "+Integer.toString(parentChange));
@@ -1570,19 +1570,21 @@ public class PerforceSCM extends SCM {
         }
     }
 
-    public int getLastChange(@CheckForNull Run build) {
+    public int getLastChange(@CheckForNull Run build, String projectPathToCheck) {
     	// If we are starting a new hudson project on existing work and want to skip the prior history...
     	if (firstChange > 0)
     		return firstChange;
-
-    	return getLastChangeNoFirstChange(build, ignoreFailedBuildsForChanges);
+    	String viewSpec = null;
+    	if(checkViewMapWhenLookingForPreviousChangeNumber)
+    		viewSpec=projectPathToCheck;
+    	return getLastChangeNoFirstChange(build, ignoreFailedBuildsForChanges, viewSpec);
     }
 
-    private static int getLastChangeNoFirstChange(@CheckForNull Run build, boolean requireSuccessfulBuild) {
+    private static int getLastChangeNoFirstChange(@CheckForNull Run build, boolean requireSuccessfulBuild, String projectPathMustMatch) {
 
         // If we can't find a PerforceTagAction, we will default to 0.
 
-        PerforceTagAction action = getMostRecentTagAction(build, requireSuccessfulBuild);
+        PerforceTagAction action = getMostRecentTagAction(build, requireSuccessfulBuild, projectPathMustMatch);
         if (action == null)
             return 0;
 
@@ -1591,21 +1593,29 @@ public class PerforceSCM extends SCM {
     }
 
     @CheckForNull
-    private static PerforceTagAction getMostRecentTagAction(@CheckForNull Run build, boolean requireSuccessfulBuild) {
-        if (build == null)
-            return null;
-
-        PerforceTagAction action = build.getAction(PerforceTagAction.class);
-        if (action != null)
-            return action;
-
-        // if build had no actions, keep going back until we find one that does.
-        Run nextRunToCheck = build.getPreviousBuild();
-        if(requireSuccessfulBuild && nextRunToCheck!=null){
-        	if(build.getResult().isWorseThan(Result.UNSTABLE))
-        		nextRunToCheck=nextRunToCheck.getPreviousCompletedBuild();
+    private static PerforceTagAction getMostRecentTagAction(@CheckForNull Run build, boolean requireSuccessfulBuild, String projectPathMustMatch) {
+        while(build != null){
+        	if(buildIsCanidate(build, requireSuccessfulBuild, projectPathMustMatch))
+            	return build.getAction(PerforceTagAction.class);
+        	build = build.getPreviousCompletedBuild();
         }
-        return getMostRecentTagAction(nextRunToCheck,requireSuccessfulBuild);
+        return null;
+    }
+    
+    private static boolean buildIsCanidate(Run build, boolean requireSuccessfulBuild, String projectPath){
+    	 PerforceTagAction action = build.getAction(PerforceTagAction.class);
+         if (action != null){
+        	 if(requireSuccessfulBuild)
+        		 if(build.getResult().isWorseThan(Result.UNSTABLE))
+        			 return false;
+        	 if(StringUtils.isNotBlank(projectPath)){
+        		 LOGGER.info("Comparing prject path '"+action.getView()+"' and '"+projectPath+"'");
+        		 if(!StringUtils.equals(StringUtils.deleteWhitespace(action.getView()), StringUtils.deleteWhitespace(projectPath)))
+        			 return false;
+        	 }
+        	 return true;
+         }
+         return false;
     }
 
     private com.tek42.perforce.model.Workspace getPerforceWorkspace(AbstractProject project, String projectPath,
@@ -2240,7 +2250,7 @@ public class PerforceSCM extends SCM {
             }
 
             Run upStreamRun = job.getLastSuccessfulBuild();
-            int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun,false);
+            int lastUpStreamChange = getLastChangeNoFirstChange(upStreamRun,false,null);
             if (lastUpStreamChange < 1) {
                 FormValidation.warning("No Perforce change found in this project");
             }
@@ -2866,7 +2876,23 @@ public class PerforceSCM extends SCM {
         this.updateCounterValue = updateCounterValue;
     }
 
-    /**
+    public boolean isIgnoreFailedBuildsForChanges() {
+		return ignoreFailedBuildsForChanges;
+	}
+
+	public void setIgnoreFailedBuildsForChanges(boolean ignoreFailedBuildsForChanges) {
+		this.ignoreFailedBuildsForChanges = ignoreFailedBuildsForChanges;
+	}
+
+	public boolean isCheckViewMapWhenLookingForPreviousChangeNumber() {
+		return checkViewMapWhenLookingForPreviousChangeNumber;
+	}
+
+	public void setCheckViewMapWhenLookingForPreviousChangeNumber(boolean checkViewMapWhenLookingForPreviousChangeNumber) {
+		this.checkViewMapWhenLookingForPreviousChangeNumber = checkViewMapWhenLookingForPreviousChangeNumber;
+	}
+
+	/**
      * @return True if the P4PASSWD value must be set in the environment
      */
     public boolean isExposeP4Passwd() {
