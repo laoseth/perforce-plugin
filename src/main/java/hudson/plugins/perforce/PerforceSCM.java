@@ -1,32 +1,76 @@
 package hudson.plugins.perforce;
-import hudson.plugins.perforce.config.DepotType;
+import static hudson.Util.fixNull;
+import static hudson.plugins.perforce.utils.MacroStringHelper.substituteParameters;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.io.Serializable;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Hashtable;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.servlet.ServletException;
+
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+
 import com.tek42.perforce.Depot;
 import com.tek42.perforce.PerforceException;
 import com.tek42.perforce.model.Changelist;
+import com.tek42.perforce.model.Changelist.FileEntry;
 import com.tek42.perforce.model.Counter;
 import com.tek42.perforce.model.Label;
 import com.tek42.perforce.model.Workspace;
 import com.tek42.perforce.parse.Counters;
 import com.tek42.perforce.parse.Workspaces;
-import com.tek42.perforce.model.Changelist.FileEntry;
 
 import hudson.AbortException;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
-import hudson.Util;
 import hudson.Launcher;
-import static hudson.Util.fixNull;
+import hudson.Util;
 import hudson.matrix.MatrixBuild;
 import hudson.matrix.MatrixRun;
-import hudson.model.*;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.BuildListener;
+import hudson.model.Computer;
+import hudson.model.Hudson;
+import hudson.model.Item;
+import hudson.model.Job;
+import hudson.model.Node;
+import hudson.model.Project;
+import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.model.User;
 import hudson.model.listeners.ItemListener;
 import hudson.plugins.perforce.config.CleanTypeConfig;
+import hudson.plugins.perforce.config.DepotType;
 import hudson.plugins.perforce.config.MaskViewConfig;
 import hudson.plugins.perforce.config.WorkspaceCleanupConfig;
 import hudson.plugins.perforce.utils.MacroStringHelper;
-import static hudson.plugins.perforce.utils.MacroStringHelper.substituteParameters;
-
 import hudson.plugins.perforce.utils.ParameterSubstitutionException;
 import hudson.scm.ChangeLogParser;
 import hudson.scm.PollingResult;
@@ -36,33 +80,8 @@ import hudson.scm.SCMRevisionState;
 import hudson.tasks.Messages;
 import hudson.util.FormValidation;
 import hudson.util.LogTaskListener;
-
 import hudson.util.StreamTaskListener;
 import net.sf.json.JSONObject;
-
-import org.apache.commons.lang.StringUtils;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.QueryParameter;
-import org.kohsuke.stapler.StaplerRequest;
-
-import javax.servlet.ServletException;
-import java.io.File;
-import java.io.FileFilter;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.PrintStream;
-import java.io.PrintWriter;
-import java.io.Serializable;
-import java.io.StringWriter;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
-import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
 
 /**
  * Extends {@link SCM} to provide integration with Perforce SCM repositories.
@@ -989,6 +1008,7 @@ public class PerforceSCM extends SCM {
             List<Changelist> changes;
             if (p4Label != null && !p4Label.trim().isEmpty()) {
                 newestChange = depot.getChanges().getHighestLabelChangeNumber(p4workspace, p4Label.trim(), p4WorkspacePath);
+                log.println("Using p4 label '"+p4Label+"' for newest change.  Newest change found is "+newestChange);
             } else {
                 if (p4UpstreamProject != null && p4UpstreamProject.length() > 0) {
                     log.println("Using last successful or unstable build of upstream project " + p4UpstreamProject);
@@ -1014,6 +1034,7 @@ public class PerforceSCM extends SCM {
                     counterName = MacroStringHelper.substituteParameters(this.p4Counter, this, build, null);
                     Counter counter = depot.getCounters().getCounter(counterName);
                     newestChange = counter.getValue();
+                    log.println("Using p4 counter '"+p4Counter+"' for newest change.  Newest change found is "+newestChange);
                 } else {
                     //use the latest submitted change from workspace, or depot
                     try {
@@ -1058,10 +1079,21 @@ public class PerforceSCM extends SCM {
             }
             
             if (lastChange <= 0) {
-                lastChange = newestChange - MAX_CHANGESETS_ON_FIRST_BUILD;
-                if (lastChange < 0) {
-                    lastChange = 0;
-                }
+            	LOGGER.log(Level.FINE, "This is the first build, limiting to the last "+MAX_CHANGESETS_ON_FIRST_BUILD+ " changes");
+            	List<Integer> recentChangeNumbers = depot.getChanges().getChangeNumbers(p4WorkspacePath, newestChange, MAX_CHANGESETS_ON_FIRST_BUILD);
+            	if(recentChangeNumbers==null || recentChangeNumbers.isEmpty()){
+            		LOGGER.log(Level.FINE, "Couldn't find the recent changes of the workspacePath("+p4WorkspacePath+", trying entire workspace"); 
+            		recentChangeNumbers = depot.getChanges().getChangeNumbers("//...", newestChange, MAX_CHANGESETS_ON_FIRST_BUILD);
+            	}
+            	if(recentChangeNumbers!=null && !recentChangeNumbers.isEmpty()){
+            		lastChange = recentChangeNumbers.get(recentChangeNumbers.size()-1);
+            	}else{
+            		LOGGER.log(Level.FINE, "Couldn't find the recent changes of the entire workspace, just subtracting 50");
+	                lastChange = newestChange - MAX_CHANGESETS_ON_FIRST_BUILD;
+	                if (lastChange < 0) {
+	                    lastChange = 0;
+	                }
+            	}
             }
             
             // Get ChangeLog
@@ -1606,10 +1638,12 @@ public class PerforceSCM extends SCM {
     	 PerforceTagAction action = build.getAction(PerforceTagAction.class);
          if (action != null){
         	 if(requireSuccessfulBuild)
-        		 if(build.getResult().isWorseThan(Result.UNSTABLE))
-        			 return false;
+        		 if(build.getResult().isWorseThan(Result.SUCCESS)){
+        			LOGGER.log(Level.FINER, "Skipped build "+build.getNumber()+" as it was unsuccessful, status "+build.getResult());
+        			return false;
+        		 }
         	 if(StringUtils.isNotBlank(projectPath)){
-        		 LOGGER.info("Comparing prject path '"+action.getView()+"' and '"+projectPath+"'");
+        		 LOGGER.log(Level.FINER, "Comparing project path '"+action.getView()+"' and '"+projectPath+"'");
         		 if(!StringUtils.equals(StringUtils.deleteWhitespace(action.getView()), StringUtils.deleteWhitespace(projectPath)))
         			 return false;
         	 }
